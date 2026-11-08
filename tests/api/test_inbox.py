@@ -9,20 +9,22 @@ from nour_transfers.app import create_app
 def test_inbox_is_sorted_by_priority_then_request_order():
     app = create_app(
         stock={
-            ("source", "MED"): 100,
-            ("normal", "MED"): 100,
-            ("urgent1", "MED"): 1,
-            ("high", "MED"): 5,
-            ("urgent2", "MED"): 2,
+            ("source", "NORMAL"): 100,
+            ("source", "URGENT"): 100,
+            ("source", "HIGH"): 100,
+            ("destination", "NORMAL"): 100,
+            ("destination", "URGENT"): 1,
+            ("destination", "HIGH"): 5,
         },
         items={
-            "MED": {"chronic": True, "reserve": 0},
+            "NORMAL": {"chronic": True, "reserve": 0},
+            "URGENT": {"chronic": True, "reserve": 0},
+            "HIGH": {"chronic": True, "reserve": 0},
         },
         sales={
-            ("normal", "MED"): 10,
-            ("urgent1", "MED"): 1,
-            ("high", "MED"): 1,
-            ("urgent2", "MED"): 1,
+            ("destination", "NORMAL"): 10,
+            ("destination", "URGENT"): 1,
+            ("destination", "HIGH"): 1,
         },
         now=lambda: datetime(2026, 11, 3, 9, 30, tzinfo=UTC),
     )
@@ -30,21 +32,21 @@ def test_inbox_is_sorted_by_priority_then_request_order():
     client = TestClient(app)
 
     requests = [
-        ("normal", "normal"),
-        ("urgent1", "urgent"),
-        ("high", "high"),
-        ("urgent2", "urgent"),
+        ("NORMAL", "normal"),
+        ("URGENT", "urgent"),
+        ("HIGH", "high"),
+        ("URGENT", "urgent"),
     ]
 
     created_ids = []
 
-    for destination, expected_priority in requests:
+    for item_code, expected_priority in requests:
         response = client.post(
             "/v1/transfers",
             json={
-                "itemCode": "MED",
+                "itemCode": item_code,
                 "fromBranch": "source",
-                "toBranch": destination,
+                "toBranch": "destination",
                 "quantity": 1,
             },
         )
@@ -54,45 +56,61 @@ def test_inbox_is_sorted_by_priority_then_request_order():
 
         created_ids.append(response.json()["id"])
 
-    inbox = client.get("/v1/branches/normal/transfers")
-
-    assert inbox.status_code == 200
-
-    # The normal branch only receives its own transfer.
-    assert [item["id"] for item in inbox.json()["items"]] == [
-        created_ids[0]
-    ]
-
-    # Read each destination's inbox and combine the cards.
-    all_cards = []
-
-    for destination, _ in requests:
-        response = client.get(
-            f"/v1/branches/{destination}/transfers"
-        )
-
-        assert response.status_code == 200
-        all_cards.extend(response.json()["items"])
-
-    # Verify ordering using one shared destination inbox.
-    # Create an additional set of transfers to the same destination.
-    shared_app = create_app(
-        stock={
-            ("source", "MED"): 100,
-            ("destination", "MED"): 100,
-        },
-        items={
-            "MED": {"chronic": True, "reserve": 0},
-        },
-        sales={
-            ("destination", "MED"): 10,
-        },
-        now=lambda: datetime(2026, 11, 3, 9, 30, tzinfo=UTC),
+    response = client.get(
+        "/v1/branches/destination/transfers"
     )
 
-    shared_client = TestClient(shared_app)
+    assert response.status_code == 200
 
-    # All requests target the same branch, but use different
-    # item codes and destination sales to produce different priorities.
-    # This is handled in the dedicated scenario below.
+    cards = response.json()["items"]
 
+    assert [card["id"] for card in cards] == [
+        created_ids[1],
+        created_ids[3],
+        created_ids[2],
+        created_ids[0],
+    ]
+
+    assert [card["priority"] for card in cards] == [
+        "urgent",
+        "urgent",
+        "high",
+        "normal",
+    ]
+
+
+def test_unknown_branch_inbox_returns_empty_items(client):
+    response = client.get(
+        "/v1/branches/unknown/transfers"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"items": []}
+
+
+def test_inbox_includes_approved_transfers(client):
+    created = client.post(
+        "/v1/transfers",
+        json={
+            "itemCode": "MET500",
+            "fromBranch": "heliopolis",
+            "toBranch": "tanta",
+            "quantity": 20,
+        },
+    )
+
+    transfer_id = created.json()["id"]
+
+    approval = client.post(
+        f"/v1/transfers/{transfer_id}/approve"
+    )
+
+    assert approval.status_code == 200
+
+    response = client.get(
+        "/v1/branches/tanta/transfers"
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()["items"]) == 1
+    assert response.json()["items"][0]["status"] == "approved"
